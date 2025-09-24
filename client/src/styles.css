@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,body,#root{height:100%}
+
+body{
+  background-image: radial-gradient(circle at 20% 10%, rgba(0,168,132,0.06), transparent 20%), radial-gradient(circle at 80% 90%, rgba(0,55,58,0.05), transparent 15%);
+}
+
+/* subtle star particles */
+.particle {
+  position: absolute; width:2px; height:2px; background:rgba(255,255,255,0.8); border-radius:50%; opacity:0.9;
+  animation: twinkle 3s ease-in-out infinite;
+}
+@keyframes twinkle { 0%{opacity:0.2}50%{opacity:1}100%{opacity:0.2} }
+
+/* Themed scrollbar for agent log */
+.agent-log::-webkit-scrollbar { width: 10px; }
+.agent-log::-webkit-scrollbar-track { background: linear-gradient(180deg, rgba(0,16,33,0.15), rgba(0,55,58,0.06)); border-radius: 999px; }
+.agent-log::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #00a884, #00675b); border-radius: 999px; box-shadow: inset 0 0 0 2px rgba(0,0,0,0.2); }
+.agent-log::-webkit-scrollbar-thumb:hover { filter: brightness(1.1); }
+
+/* Firefox scrollbar */
+.agent-log { scrollbar-width: thin; scrollbar-color: #00a884 rgba(0,16,33,0.12); }
