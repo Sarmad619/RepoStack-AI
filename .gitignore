@@ -4,3 +4,5 @@ server/node_modules/
 .env
 .env.local
 server/.env
+
+Features_add.md

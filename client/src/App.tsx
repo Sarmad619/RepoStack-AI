@@ -17,11 +17,49 @@ function LogPanel({ logs, collapsed, onToggle }: any) {
   )
 }
 
+function ReferenceCard({ refData }: any) {
+  const [open, setOpen] = useState(false)
+  const excerpt = refData?.excerpt || ''
+  const truncated = excerpt.length > 400 ? excerpt.slice(0, 400) + '\n\n...TRUNCATED...' : excerpt
+
+  const copyToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(excerpt)
+      // lightweight feedback
+      // eslint-disable-next-line no-alert
+      alert('Reference copied to clipboard')
+    } catch (err) {
+      console.warn('clipboard copy failed', err)
+    }
+  }
+
+  return (
+    <div className="p-3 bg-[rgba(255,255,255,0.01)] rounded border border-[rgba(255,255,255,0.03)]">
+      <div className="flex items-start justify-between">
+        <div className="text-sm font-medium text-gray-100">{refData.path}</div>
+        <div className="flex gap-2">
+          <button onClick={()=>setOpen(o=>!o)} className="text-xs px-2 py-1 bg-[rgba(255,255,255,0.03)] rounded">{open ? 'Hide' : 'Show'}</button>
+          <button onClick={copyToClipboard} className="text-xs px-2 py-1 bg-[rgba(255,255,255,0.03)] rounded">Copy</button>
+        </div>
+      </div>
+      <div className="mt-2 text-xs text-gray-200 font-mono">
+        {open ? (
+          <pre className="whitespace-pre-wrap text-[12px]">{excerpt}</pre>
+        ) : (
+          <pre className="whitespace-pre-wrap text-[12px]">{truncated}</pre>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function App(){
   const [repo, setRepo] = useState('')
   const [logs, setLogs] = useState<string[]>([])
   const [collapsed, setCollapsed] = useState(false)
   const [analysis, setAnalysis] = useState<any>(null)
+  const [question, setQuestion] = useState('Give me a high-level walkthrough of the codebase and where authentication is handled.')
+  const [walkthrough, setWalkthrough] = useState<any>(null)
   const evtSourceRef = useRef<EventSource | null>(null)
 
   useEffect(()=>{ return ()=>{ if (evtSourceRef.current) evtSourceRef.current.close() } }, [])
@@ -41,6 +79,19 @@ export default function App(){
     es.onerror = (ev)=>{ addLog('EventSource error'); es.close(); }
   }
 
+  const askWalkthrough = async () => {
+    setLogs([])
+    setWalkthrough(null)
+    if (evtSourceRef.current) evtSourceRef.current.close()
+    const url = `http://localhost:4000/api/walkthrough?repo=${encodeURIComponent(repo)}&question=${encodeURIComponent(question)}`
+    const es = new EventSource(url)
+    evtSourceRef.current = es
+    es.addEventListener('log', (e:any)=>{ const d=JSON.parse(e.data); addLog(d.message) })
+    es.addEventListener('result', (e:any)=>{ const d=JSON.parse(e.data); setWalkthrough(d.walkthrough) })
+    es.addEventListener('error', (e:any)=>{ try{ const d=JSON.parse(e.data); addLog('ERROR: '+(d.message||JSON.stringify(d))) }catch{ addLog('Unknown error event') } })
+    es.onerror = (ev)=>{ addLog('EventSource error'); es.close(); }
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-[#001021] via-[#00373a] to-[#00a884] text-white p-8 font-sans">
       <div className="max-w-4xl mx-auto">
@@ -53,6 +104,11 @@ export default function App(){
           <div className="flex gap-2">
             <input className="flex-1 p-3 bg-transparent border border-dotted border-gray-600 rounded-md" placeholder="https://github.com/owner/repo" value={repo} onChange={e=>setRepo(e.target.value)} />
             <button onClick={analyze} className="px-4 py-2 bg-gradient-to-r from-[#00373a] to-[#00a884] hover:shadow-[0_0_20px_rgba(0,168,132,0.5)] rounded">Analyze</button>
+            <button onClick={askWalkthrough} className="px-4 py-2 bg-gradient-to-r from-[#7b6bff] to-[#5a3cff] hover:shadow-[0_0_20px_rgba(123,107,255,0.4)] rounded">Deep Dive</button>
+          </div>
+          <div className="mt-3">
+            <input value={question} onChange={e=>setQuestion(e.target.value)} className="w-full p-2 bg-transparent border border-dashed border-gray-600 rounded-md text-sm" />
+            <div className="text-xs text-gray-400 mt-1">Ask targeted questions about the codebase (e.g., "Where is auth handled?", "Trace request X").</div>
           </div>
         </section>
 
@@ -72,6 +128,44 @@ export default function App(){
             ) : (
               <div className="text-gray-400">No analysis yet. Provide a GitHub repo URL and click Analyze.</div>
             )}
+
+            {walkthrough ? (
+              <div className="mt-6 p-4 bg-[rgba(255,255,255,0.02)] rounded">
+                <h3 className="text-lg mb-3">Walkthrough</h3>
+                {/* Answer: render paragraphs for readability */}
+                <div className="text-sm text-gray-100 mb-4">
+                  {typeof walkthrough.answer === 'string' ? (
+                    walkthrough.answer.split(/\n\n+/).map((p:string,i:number)=>(
+                      <p key={i} className="mb-3 leading-relaxed">{p}</p>
+                    ))
+                  ) : (
+                    <pre className="whitespace-pre-wrap font-mono text-xs">{JSON.stringify(walkthrough.answer, null, 2)}</pre>
+                  )}
+                </div>
+
+                {/* Trace steps (if any) */}
+                {walkthrough.trace && walkthrough.trace.length>0 && (
+                  <div className="mb-4">
+                    <h4 className="text-sm mb-2">Trace</h4>
+                    <ol className="list-decimal pl-5 text-sm text-gray-200">
+                      {walkthrough.trace.map((t:any,i:number)=>(<li key={i} className="mb-2">{t}</li>))}
+                    </ol>
+                  </div>
+                )}
+
+                {/* References: show as expandable cards with excerpt and copy */}
+                {walkthrough.references && walkthrough.references.length>0 && (
+                  <div>
+                    <h4 className="text-sm mb-2">References</h4>
+                    <div className="space-y-3">
+                      {walkthrough.references.map((r:any,i:number)=> (
+                        <ReferenceCard key={i} refData={r} />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : null}
           </div>
 
           <div className="p-6 bg-[rgba(255,255,255,0.02)] rounded-xl">
