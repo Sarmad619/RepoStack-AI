@@ -10,6 +10,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Simple in-memory rate limiter (per IP). Configurable via env vars.
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1 minute
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '10', 10); // 10 requests per window
+const rateStore = new Map();
+
+function rateLimitMiddleware(req, res, next) {
+  try {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const entry = rateStore.get(ip) || { count: 0, windowStart: now };
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+      entry.count = 0;
+      entry.windowStart = now;
+    }
+    entry.count += 1;
+    rateStore.set(ip, entry);
+    if (entry.count > RATE_LIMIT_MAX) {
+      return res.status(429).json({ error: 'rate_limited', message: `Too many requests. Limit is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MS/1000}s` });
+    }
+    next();
+  } catch (err) {
+    // don't block on rate limiter errors
+    next();
+  }
+}
+
+// Apply rate limiter to analysis endpoints
+app.use(['/api/analyze', '/api/walkthrough'], rateLimitMiddleware);
+
 const PORT = process.env.PORT || 4000;
 
 let openai = null;
@@ -27,6 +56,21 @@ if (!process.env.OPENAI_API_KEY) {
 function sendSSE(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// axios get with retry/backoff
+async function axiosGetWithRetry(url, opts = {}, attempts = 3, backoff = 300) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await axios.get(url, opts);
+    } catch (err) {
+      lastErr = err;
+      // exponential backoff
+      await new Promise(r => setTimeout(r, backoff * Math.pow(2, i)));
+    }
+  }
+  throw lastErr;
 }
 
 async function fetchRepoContents(owner, repo, token) {
@@ -64,7 +108,7 @@ async function fetchRepoContents(owner, repo, token) {
   return result;
 }
 
-async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}) {
+async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = null, question = '') {
   // opts: { maxFiles = 50, maxBytes = 200000 }
   const maxFiles = opts.maxFiles || 50;
   const maxBytes = opts.maxBytes || 200000; // 200 KB
@@ -73,43 +117,104 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}) {
   const result = { files: [], totalBytes: 0 };
   try {
     // Get default branch
-    const repoRes = await axios.get(base, { headers });
+    const repoRes = await axiosGetWithRetry(base, { headers });
     const defaultBranch = repoRes.data.default_branch || 'main';
-    sendLogIfPossible();
+    if (logger) try { logger('Determined default branch: ' + defaultBranch) } catch(e){}
     // Get git tree recursively
-    const treeRes = await axios.get(`${base}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`, { headers });
+    const treeRes = await axiosGetWithRetry(`${base}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`, { headers });
     const tree = treeRes.data.tree || [];
     // Filter blobs and keep common source file extensions
     const exts = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.cs', '.rb', '.php', '.json', '.md', '.html', '.css'];
     const candidates = tree.filter(t => t.type === 'blob' && exts.some(e => t.path.endsWith(e)));
+    // Skip well-known vendor / third-party directories
+    const skipPatterns = ['node_modules/', 'vendor/', 'third_party/', 'site-packages/', 'dist/', 'build/', 'coverage/', '.pytest_cache/', '.venv/', '__pycache__/', '.git/'];
+    const filteredCandidates = candidates.filter(t => !skipPatterns.some(p => t.path.includes(p)));
     // Sort by path length (prefer top-level) and then by size if available
-    candidates.sort((a, b) => (a.path.split('/').length - b.path.split('/').length) || ((b.size || 0) - (a.size || 0)));
-    for (const item of candidates) {
+    filteredCandidates.sort((a, b) => (a.path.split('/').length - b.path.split('/').length) || ((b.size || 0) - (a.size || 0)));
+
+    // If a question is provided, prioritize files that match keywords in path first
+    const keywords = (question || '').toLowerCase().split(/\W+/).filter(w => w.length > 3);
+    let topCandidates = filteredCandidates;
+    if (keywords.length > 0) {
+      // Fast path: rank by keyword matches in path (no content fetch yet)
+      topCandidates = filteredCandidates.map(f => {
+        const path = f.path.toLowerCase();
+        let score = 0;
+        for (const k of keywords) { if (path.includes(k)) score += 5; }
+        return { item: f, score };
+      }).sort((a,b)=>b.score-a.score).map(x=>x.item);
+      // Keep a reasonable number to fetch content for scoring
+      topCandidates = topCandidates.slice(0, 200);
+    } else {
+      topCandidates = filteredCandidates.slice(0, 200);
+    }
+
+    // Ensure dependency files (package.json, pyproject.toml, requirements.txt) are included later
+    const depFilesSet = new Set(['package.json','requirements.txt','pyproject.toml']);
+
+    // Two-pass: fetch content for top candidates and compute content-based relevance using keywords
+    const scoredFiles = [];
+    for (const item of topCandidates) {
       if (result.files.length >= maxFiles) break;
       if (result.totalBytes >= maxBytes) break;
       try {
-        const fileRes = await axios.get(`${base}/contents/${encodeURIComponent(item.path)}?ref=${encodeURIComponent(defaultBranch)}`, { headers });
+        const fileRes = await axiosGetWithRetry(`${base}/contents/${encodeURIComponent(item.path)}?ref=${encodeURIComponent(defaultBranch)}`, { headers });
         if (fileRes.data && fileRes.data.content) {
           const buff = Buffer.from(fileRes.data.content, fileRes.data.encoding || 'base64');
           const content = buff.toString('utf8');
-          // truncate very large files
+          // truncate very large files at fetch level
           const truncated = content.length > 100000 ? content.slice(0, 100000) + '\n\n...TRUNCATED...' : content;
-          const bytes = Buffer.byteLength(truncated, 'utf8');
-          if (result.totalBytes + bytes > maxBytes) break;
-          result.files.push({ path: item.path, content: truncated });
-          result.totalBytes += bytes;
+          // compute a simple relevance score using keywords in path and content
+          let score = 0;
+          const pathLower = item.path.toLowerCase();
+          for (const k of keywords) { if (pathLower.includes(k)) score += 10; }
+          const contentLower = truncated.toLowerCase();
+          for (const k of keywords) {
+            const occ = (contentLower.match(new RegExp(k, 'g')) || []).length;
+            score += Math.min(occ, 20); // cap per keyword
+          }
+          scoredFiles.push({ path: item.path, content: truncated, bytes: Buffer.byteLength(truncated, 'utf8'), score });
         }
       } catch (err) {
+        if (logger) try { logger(`Skipped ${item.path} due to fetch error`); } catch(e){}
         // skip file fetch errors
       }
     }
+
+    // Sort by score and then by path depth
+    scoredFiles.sort((a,b)=> (b.score - a.score) || (a.path.split('/').length - b.path.split('/').length));
+
+    // Add top scored files until limits hit
+    for (const f of scoredFiles) {
+      if (result.files.length >= maxFiles) break;
+      if (result.totalBytes + f.bytes > maxBytes) break;
+      result.files.push({ path: f.path, content: f.content });
+      result.totalBytes += f.bytes;
+    }
+
+    // Always ensure dependency files are present (fetch them if they exist and we still have headroom)
+    for (const dep of Array.from(depFilesSet)) {
+      if (result.files.some(ff => ff.path === dep)) continue;
+      try {
+        const r = await axiosGetWithRetry(`${base}/contents/${dep}`, { headers });
+        if (r.data && r.data.content) {
+          const buff = Buffer.from(r.data.content, r.data.encoding || 'base64');
+          const content = buff.toString('utf8');
+          const bytes = Buffer.byteLength(content, 'utf8');
+          if (result.totalBytes + bytes <= maxBytes) {
+            result.files.push({ path: dep, content });
+            result.totalBytes += bytes;
+          }
+        }
+      } catch (err) {
+        // ignore missing dep files
+      }
+    }
   } catch (err) {
+    if (logger) try { logger('Error while building file list: ' + (err && err.message ? err.message : String(err))); } catch(e){}
     // return partial result
   }
   return result;
-
-  // local helper to avoid lint warnings when used internally
-  function sendLogIfPossible() { /* placeholder; caller may send SSE logs separately */ }
 }
 
 function makePrompt(repoUrl, data) {
@@ -198,8 +303,8 @@ app.get('/api/walkthrough', async (req, res) => {
 
   sendSSE(res, 'log', { message: 'Starting walkthrough' });
   try {
-    sendSSE(res, 'log', { message: 'Fetching repository tree and source files (limited)' });
-    const filesData = await fetchRepoTreeAndFiles(owner, repoName, process.env.GITHUB_TOKEN, { maxFiles: 60, maxBytes: 300000 });
+  sendSSE(res, 'log', { message: 'Fetching repository tree and source files (limited)' });
+  const filesData = await fetchRepoTreeAndFiles(owner, repoName, process.env.GITHUB_TOKEN, { maxFiles: 60, maxBytes: 300000 }, (m)=>sendSSE(res,'log',{message:m}), question);
     sendSSE(res, 'log', { message: `Fetched ${filesData.files.length} files (${filesData.totalBytes} bytes)` });
 
     // Build a detailed prompt that includes the question and the collected files
