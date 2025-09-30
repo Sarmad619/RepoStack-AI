@@ -53,6 +53,10 @@ if (!process.env.OPENAI_API_KEY) {
   }
 }
 
+// In-memory per-repo rules store: { "owner/repo": { whitelist: [], blacklist: [] } }
+const rulesStore = new Map();
+
+
 function sendSSE(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -126,28 +130,28 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
     // Filter blobs and keep common source file extensions
     const exts = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.cs', '.rb', '.php', '.json', '.md', '.html', '.css'];
     const candidates = tree.filter(t => t.type === 'blob' && exts.some(e => t.path.endsWith(e)));
-    // Skip well-known vendor / third-party directories
+    // Skip well-known vendor / third-party directories unless overridden by per-repo rules
     const skipPatterns = ['node_modules/', 'vendor/', 'third_party/', 'site-packages/', 'dist/', 'build/', 'coverage/', '.pytest_cache/', '.venv/', '__pycache__/', '.git/'];
-    const filteredCandidates = candidates.filter(t => !skipPatterns.some(p => t.path.includes(p)));
+    const repoKey = `${owner}/${repo}`;
+    const rules = rulesStore.get(repoKey) || { whitelist: [], blacklist: [] };
+    const filteredCandidates = candidates.filter(t => {
+      // If path matches a whitelist pattern, include it
+      for (const w of rules.whitelist || []) {
+        if (t.path.includes(w)) return true;
+      }
+      // If path matches a blacklist pattern, exclude it
+      for (const b of rules.blacklist || []) {
+        if (t.path.includes(b)) return false;
+      }
+      return !skipPatterns.some(p => t.path.includes(p));
+    });
     // Sort by path length (prefer top-level) and then by size if available
     filteredCandidates.sort((a, b) => (a.path.split('/').length - b.path.split('/').length) || ((b.size || 0) - (a.size || 0)));
 
-    // If a question is provided, prioritize files that match keywords in path first
+    // Prepare keywords (fallback) and an initial candidate window to fetch content for scoring
     const keywords = (question || '').toLowerCase().split(/\W+/).filter(w => w.length > 3);
-    let topCandidates = filteredCandidates;
-    if (keywords.length > 0) {
-      // Fast path: rank by keyword matches in path (no content fetch yet)
-      topCandidates = filteredCandidates.map(f => {
-        const path = f.path.toLowerCase();
-        let score = 0;
-        for (const k of keywords) { if (path.includes(k)) score += 5; }
-        return { item: f, score };
-      }).sort((a,b)=>b.score-a.score).map(x=>x.item);
-      // Keep a reasonable number to fetch content for scoring
-      topCandidates = topCandidates.slice(0, 200);
-    } else {
-      topCandidates = filteredCandidates.slice(0, 200);
-    }
+    // Fetch a larger window for potential semantic reranking
+    let topCandidates = filteredCandidates.slice(0, 500);
 
     // Ensure dependency files (package.json, pyproject.toml, requirements.txt) are included later
     const depFilesSet = new Set(['package.json','requirements.txt','pyproject.toml']);
@@ -173,7 +177,7 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
             const occ = (contentLower.match(new RegExp(k, 'g')) || []).length;
             score += Math.min(occ, 20); // cap per keyword
           }
-          scoredFiles.push({ path: item.path, content: truncated, bytes: Buffer.byteLength(truncated, 'utf8'), score });
+          scoredFiles.push({ path: item.path, content: truncated, bytes: Buffer.byteLength(truncated, 'utf8'), score, originalItem: item });
         }
       } catch (err) {
         if (logger) try { logger(`Skipped ${item.path} due to fetch error`); } catch(e){}
@@ -181,14 +185,41 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
       }
     }
 
-    // Sort by score and then by path depth
-    scoredFiles.sort((a,b)=> (b.score - a.score) || (a.path.split('/').length - b.path.split('/').length));
+    // If we have a question and OpenAI embeddings available, compute embeddings to re-rank semantically
+    if (question && openai && openai.embeddings && scoredFiles.length > 0) {
+      try {
+        const texts = [question].concat(scoredFiles.map(f => f.content.slice(0, 2000)));
+        const embRes = await openai.embeddings.create({ model: 'text-embedding-3-large', input: texts });
+        const vectors = embRes.data.map(d => d.embedding);
+        const qVec = vectors[0];
+        const fileVecs = vectors.slice(1);
+        // cosine similarity helpers
+        function dot(a,b){let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s}
+        function norm(a){let s=0;for(let i=0;i<a.length;i++)s+=a[i]*a[i];return Math.sqrt(s)}
+        const qNorm = norm(qVec);
+        scoredFiles.forEach((f, idx)=>{
+          const fv = fileVecs[idx];
+          const sim = qNorm===0 ? 0 : dot(qVec,fv)/(qNorm*norm(fv));
+          f.semanticScore = sim;
+          // combine with fallback score
+          f.finalScore = (f.score || 0) * 0.2 + sim * 100;
+        });
+        scoredFiles.sort((a,b)=> (b.finalScore - a.finalScore) || (a.path.split('/').length - b.path.split('/').length));
+      } catch (err) {
+        // fallback to keyword ranking
+        scoredFiles.sort((a,b)=> (b.score - a.score) || (a.path.split('/').length - b.path.split('/').length));
+      }
+    } else {
+      // Sort by score and then by path depth
+      scoredFiles.sort((a,b)=> (b.score - a.score) || (a.path.split('/').length - b.path.split('/').length));
+    }
 
-    // Add top scored files until limits hit
+    // Add top scored files until limits hit and include metadata about truncation
     for (const f of scoredFiles) {
       if (result.files.length >= maxFiles) break;
       if (result.totalBytes + f.bytes > maxBytes) break;
-      result.files.push({ path: f.path, content: f.content });
+      const isTruncated = f.content.endsWith('\n\n...TRUNCATED...');
+      result.files.push({ path: f.path, content: isTruncated ? f.content.replace('\n\n...TRUNCATED...','') : f.content, truncated: isTruncated, bytes: f.bytes, score: f.finalScore || f.score });
       result.totalBytes += f.bytes;
     }
 
@@ -352,6 +383,54 @@ app.get('/api/walkthrough', async (req, res) => {
   } catch (err) {
     sendSSE(res, 'error', { message: err.message || String(err) });
     res.end();
+  }
+});
+
+// Rules management endpoints
+app.get('/api/rules', (req, res) => {
+  const repo = req.query.repo;
+  if (!repo) return res.status(400).json({ error: 'missing repo query parameter' });
+  const m = repo.match(/github.com\/(.+?)\/(.+?)(?:$|\/|\.)/i);
+  if (!m) return res.status(400).json({ error: 'invalid github repo url' });
+  const key = `${m[1]}/${m[2]}`;
+  const rules = rulesStore.get(key) || { whitelist: [], blacklist: [] };
+  res.json({ repo: key, rules });
+});
+
+app.post('/api/rules', (req, res) => {
+  const { repo, rules } = req.body || {};
+  if (!repo || !rules) return res.status(400).json({ error: 'missing repo or rules in body' });
+  const m = repo.match(/(?:github.com\/)?(.+?)\/(.+?)(?:$|\/|\.)/i);
+  if (!m) return res.status(400).json({ error: 'invalid repo format' });
+  const key = `${m[1]}/${m[2]}`;
+  const normalized = { whitelist: Array.isArray(rules.whitelist) ? rules.whitelist : [], blacklist: Array.isArray(rules.blacklist) ? rules.blacklist : [] };
+  rulesStore.set(key, normalized);
+  res.json({ repo: key, rules: normalized });
+});
+
+// Fetch single file content on-demand (bypasses truncation)
+app.get('/api/file', async (req, res) => {
+  const repo = req.query.repo;
+  const path = req.query.path;
+  if (!repo || !path) return res.status(400).json({ error: 'missing repo or path query parameter' });
+  const m = repo.match(/github.com\/(.+?)\/(.+?)(?:$|\/|\.)/i);
+  if (!m) return res.status(400).json({ error: 'invalid github repo url' });
+  const owner = m[1];
+  const repoName = m[2];
+  try {
+    const headers = process.env.GITHUB_TOKEN ? { Authorization: `token ${process.env.GITHUB_TOKEN}` } : {};
+    const repoRes = await axios.get(`https://api.github.com/repos/${owner}/${repoName}` , { headers });
+    const defaultBranch = repoRes.data.default_branch || 'main';
+    const fileRes = await axios.get(`https://api.github.com/repos/${owner}/${repoName}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(defaultBranch)}`, { headers });
+    if (fileRes.data && fileRes.data.content) {
+      const buff = Buffer.from(fileRes.data.content, fileRes.data.encoding || 'base64');
+      const content = buff.toString('utf8');
+      res.json({ path, content });
+      return;
+    }
+    res.status(404).json({ error: 'file not found' });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
   }
 });
 

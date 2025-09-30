@@ -53,6 +53,48 @@ function ReferenceCard({ refData }: any) {
   )
 }
 
+function RuleManager({ repo, onSave }: any) {
+  const [rules, setRules] = useState({ whitelist: [] as string[], blacklist: [] as string[] })
+  const [loading, setLoading] = useState(false)
+
+  useEffect(()=>{
+    if (!repo) return
+    setLoading(true)
+    axios.get(`http://localhost:4000/api/rules?repo=${encodeURIComponent(repo)}`).then(r=>{
+      setRules(r.data.rules || { whitelist: [], blacklist: [] })
+    }).catch(()=>{}).finally(()=>setLoading(false))
+  }, [repo])
+
+  const save = async ()=>{
+    if (!repo) return alert('Set a repo URL first')
+    setLoading(true)
+    try{
+      const r = await axios.post('http://localhost:4000/api/rules', { repo, rules })
+      setRules(r.data.rules)
+      onSave && onSave(r.data.rules)
+    }catch(err){ console.warn(err); alert('Failed to save rules') }
+    setLoading(false)
+  }
+
+  return (
+    <div className="mt-4">
+      <h4 className="text-sm mb-2">Per-repo Rules</h4>
+      <div className="text-xs text-gray-300 mb-2">Whitelist and blacklist are simple substring matches against file paths.</div>
+      <div className="mb-2">
+        <label className="text-xs">Whitelist (include paths)</label>
+        <textarea rows={2} value={rules.whitelist.join('\n')} onChange={e=>setRules(s=>({...s, whitelist: e.target.value.split(/\n/).map(x=>x.trim()).filter(Boolean)}))} className="w-full p-2 bg-transparent border rounded text-sm" />
+      </div>
+      <div className="mb-2">
+        <label className="text-xs">Blacklist (exclude paths)</label>
+        <textarea rows={2} value={rules.blacklist.join('\n')} onChange={e=>setRules(s=>({...s, blacklist: e.target.value.split(/\n/).map(x=>x.trim()).filter(Boolean)}))} className="w-full p-2 bg-transparent border rounded text-sm" />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={save} className="px-3 py-1 bg-[rgba(255,255,255,0.03)] rounded">{loading ? 'Saving...' : 'Save Rules'}</button>
+      </div>
+    </div>
+  )
+}
+
 export default function App(){
   const [repo, setRepo] = useState('')
   const [logs, setLogs] = useState<string[]>([])
@@ -92,6 +134,13 @@ export default function App(){
     es.onerror = (ev)=>{ addLog('EventSource error'); es.close(); }
   }
 
+  const fetchFullFile = async (path:string)=>{
+    try{
+      const r = await axios.get(`http://localhost:4000/api/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`)
+      return r.data.content
+    }catch(err){ console.warn(err); return null }
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-[#001021] via-[#00373a] to-[#00a884] text-white p-8 font-sans">
       <div className="max-w-4xl mx-auto">
@@ -106,6 +155,7 @@ export default function App(){
             <button onClick={analyze} className="px-4 py-2 bg-gradient-to-r from-[#00373a] to-[#00a884] hover:shadow-[0_0_20px_rgba(0,168,132,0.5)] rounded">Analyze</button>
             <button onClick={askWalkthrough} className="px-4 py-2 bg-gradient-to-r from-[#7b6bff] to-[#5a3cff] hover:shadow-[0_0_20px_rgba(123,107,255,0.4)] rounded">Deep Dive</button>
           </div>
+          <RuleManager repo={repo} onSave={(r:any)=>addLog('Updated rules for repo')} />
           <div className="mt-3">
             <input value={question} onChange={e=>setQuestion(e.target.value)} className="w-full p-2 bg-transparent border border-dashed border-gray-600 rounded-md text-sm" />
             <div className="text-xs text-gray-400 mt-1">Ask targeted questions about the codebase (e.g., "Where is auth handled?", "Trace request X").</div>
@@ -159,7 +209,22 @@ export default function App(){
                     <h4 className="text-sm mb-2">References</h4>
                     <div className="space-y-3">
                       {walkthrough.references.map((r:any,i:number)=> (
-                        <ReferenceCard key={i} refData={r} />
+                        <div key={i}>
+                          <ReferenceCard refData={r} />
+                          {r.excerpt && r.excerpt.length < 50 && r.path && (
+                            <div className="mt-2 text-xs text-gray-400">Excerpt truncated. <button className="underline" onClick={async ()=>{
+                              const content = await fetchFullFile(r.path)
+                              if (content) {
+                                // show full content in alert for now
+                                // eslint-disable-next-line no-alert
+                                alert(content.slice(0,2000))
+                              } else {
+                                // eslint-disable-next-line no-alert
+                                alert('Failed to fetch file content')
+                              }
+                            }}>Fetch full file</button></div>
+                          )}
+                        </div>
                       ))}
                     </div>
                   </div>
