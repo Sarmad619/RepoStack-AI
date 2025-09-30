@@ -338,6 +338,15 @@ app.get('/api/walkthrough', async (req, res) => {
   const filesData = await fetchRepoTreeAndFiles(owner, repoName, process.env.GITHUB_TOKEN, { maxFiles: 60, maxBytes: 300000 }, (m)=>sendSSE(res,'log',{message:m}), question);
     sendSSE(res, 'log', { message: `Fetched ${filesData.files.length} files (${filesData.totalBytes} bytes)` });
 
+    // Early exit if no files were fetched (rate limit, private repo, invalid URL, etc.)
+    if (!filesData.files || filesData.files.length === 0) {
+      sendSSE(res, 'log', { message: 'No repository files fetched; cannot produce walkthrough.' });
+      const reason = 'No files could be fetched from GitHub (possible 403 rate limit, missing GITHUB_TOKEN for private repo, or invalid repository). Configure GITHUB_TOKEN and try again.';
+      sendSSE(res, 'result', { walkthrough: { answer: '', references: [], trace: [], sources: [], missing: [], cannot_answer: true, reason } });
+      res.end();
+      return;
+    }
+
     // Build a detailed prompt that includes the question and the collected files
     let prompt = `You are an expert code reviewer and software engineer. The user asked: "${question}"\n\n`;
     prompt += 'Use the provided repository files to answer the question in depth. When referencing code, include file paths and short code snippets. If you trace a request or function across files, show the step-by-step trace. If you cannot find an answer in the provided files, be explicit about what is missing and where to look. Output ONLY valid JSON matching the schema: {"answer":"string","references":[{"path":"string","excerpt":"string"}],"trace": ["step descriptions"]}.\n\n';
@@ -354,11 +363,16 @@ app.get('/api/walkthrough', async (req, res) => {
       return;
     }
 
+  // Updated system instruction: allow partial answers & explicitly call out missing aspects.
+  // Schema now includes a "missing" array listing requested concepts/features not found.
+  // Only use repository files; NEVER invent functionality. Provide high-level summaries when asked.
+  const systemMsg = `You are a disciplined repository code analyst. You MUST use ONLY the repository files provided in the user's message.\nReturn ONLY valid JSON exactly matching the schema: {"answer":"string","references":[{"path":"string","excerpt":"string"}],"trace":["string"],"sources":["string"],"missing":["string"],"cannot_answer":boolean,"reason":string}.\nGuidelines:\n- Always attempt to answer with what IS present in the provided files.\n- Never mention or reference a file path that is not EXACTLY one of the provided file paths.\n- For each explicit feature or concept the user asks about that is NOT present (e.g. authentication, payment, database), add a short phrase to the 'missing' array (e.g. "authentication") and DO NOT fabricate implementation details.\n- Do NOT hallucinate code, files, libraries, or frameworks.\n- If some relevant information exists, set cannot_answer=false even if some requested concepts are missing; list those missing concepts in 'missing'.\n- Only set cannot_answer=true when NOTHING in the repo can help answer ANY part of the question. In that case answer='', references=[], trace=[], missing=[], and give a concise reason.\n- Provide at least one reference and list each file you drew from in 'sources'.\n- References excerpts must be exact substrings from the file content.\n- Keep the answer concise and scoped strictly to the repository contents.`;
+
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      messages: [{ role: 'system', content: 'You are a helpful, precise assistant. Return strict JSON only.' }, { role: 'user', content: prompt }],
+      messages: [{ role: 'system', content: systemMsg }, { role: 'user', content: prompt }],
       max_tokens: 1500,
-      temperature: 0.2
+      temperature: 0.0
     });
 
     const text = completion.choices?.[0]?.message?.content || completion.choices?.[0]?.text || '';
@@ -377,7 +391,75 @@ app.get('/api/walkthrough', async (req, res) => {
       return;
     }
 
-    sendSSE(res, 'log', { message: 'Received walkthrough answer from OpenAI' });
+    // Validate returned references/sources; allow auto-fix if missing.
+    const availablePaths = new Set(filesData.files.map(f => f.path));
+    const allFetched = filesData.files.map(f => f.path);
+
+    if (!Array.isArray(json.sources)) json.sources = [];
+    if (!Array.isArray(json.references)) json.references = [];
+    if (!Array.isArray(json.missing)) json.missing = [];
+
+    // Filter invalid sources
+    json.sources = json.sources.filter(s => typeof s === 'string' && availablePaths.has(s));
+    // Filter invalid references
+    json.references = json.references.filter(r => r && typeof r.path === 'string' && availablePaths.has(r.path));
+
+    // Auto-populate sources if empty but we have fetched files
+    if (json.sources.length === 0 && allFetched.length > 0 && json.cannot_answer !== true) {
+      json.sources = allFetched.slice(0, Math.min(5, allFetched.length));
+    }
+
+    // If references empty but sources exist, synthesize a simple reference (first file snippet)
+    if (json.references.length === 0 && json.sources.length > 0 && json.cannot_answer !== true) {
+      const first = filesData.files.find(f => f.path === json.sources[0]);
+      if (first) {
+        json.references.push({ path: first.path, excerpt: (first.content || '').slice(0, 300) });
+      }
+    }
+
+    // Decide final cannot_answer: only true if explicitly set OR still no references and answer is empty
+    if (json.cannot_answer === true || (json.references.length === 0 && (!json.answer || json.answer.trim()===''))) {
+      json.cannot_answer = true;
+      json.answer = '';
+      json.references = [];
+      json.trace = [];
+      json.missing = [];
+      if (!json.reason) json.reason = 'The information required to answer this question is not present in the provided repository files.';
+      sendSSE(res, 'log', { message: 'Walkthrough: no in-repo basis for answer (cannot_answer=true)' });
+      sendSSE(res, 'result', { walkthrough: json });
+      res.end();
+      return;
+    } else {
+      json.cannot_answer = false;
+      if (!json.reason) json.reason = '';
+    }
+
+    // Hallucination mitigation: detect file names mentioned in answer that were not fetched
+    const answerText = typeof json.answer === 'string' ? json.answer : '';
+    if (answerText) {
+      const fileLikeRegex = /[A-Za-z0-9_\-\.\/]+\.(?:js|jsx|ts|tsx|py|java|go|rb|php|rs|c|cpp|cs|json|md|html|css)/g;
+      const mentioned = Array.from(new Set(answerText.match(fileLikeRegex) || []));
+      const availablePaths = new Set(filesData.files.map(f => f.path));
+      const unknown = mentioned.filter(m => !availablePaths.has(m));
+      if (unknown.length > 0) {
+        // Remove paragraphs that solely describe unknown files
+        const paras = answerText.split(/\n\n+/);
+        const filteredParas = paras.filter(p => !unknown.some(u => p.includes(u)) || availablePaths.has(p.trim()));
+        let newAnswer = filteredParas.join('\n\n').trim();
+        if (!newAnswer) {
+          json.cannot_answer = false; // we still can provide partial high-level answer using existing files
+          newAnswer = 'Some requested components or files are not present in this repository.';
+        }
+        json.answer = newAnswer;
+        // Add unknown file concepts to missing (without duplicates, remove extensions to treat as concept?)
+        const additions = unknown.map(u => u.replace(/\.[^.]+$/, '')); // strip extension for concept tag
+        additions.forEach(a => { if (!json.missing.includes(a)) json.missing.push(a); });
+        // Add a short note in reason if reason empty
+        if (!json.reason) json.reason = 'Removed references to files not present in repository.';
+      }
+    }
+
+    sendSSE(res, 'log', { message: 'Walkthrough answer (repo-scoped) ready' });
     sendSSE(res, 'result', { walkthrough: json });
     res.end();
   } catch (err) {
