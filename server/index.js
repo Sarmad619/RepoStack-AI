@@ -15,6 +15,16 @@ const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '10', 10); // 10 requests per window
 const rateStore = new Map();
 
+// Helper to build GitHub headers with version + auth
+function buildGitHubHeaders(token) {
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28'
+  };
+  if (token) headers.Authorization = `token ${token}`;
+  return headers;
+}
+
 function rateLimitMiddleware(req, res, next) {
   try {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
@@ -78,7 +88,7 @@ async function axiosGetWithRetry(url, opts = {}, attempts = 3, backoff = 300) {
 }
 
 async function fetchRepoContents(owner, repo, token) {
-  const headers = token ? { Authorization: `token ${token}` } : {};
+  const headers = buildGitHubHeaders(token);
   const base = `https://api.github.com/repos/${owner}/${repo}`;
   const result = { readme: null, languages: null, files: [] };
   try {
@@ -116,16 +126,27 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
   // opts: { maxFiles = 50, maxBytes = 200000 }
   const maxFiles = opts.maxFiles || 50;
   const maxBytes = opts.maxBytes || 200000; // 200 KB
-  const headers = token ? { Authorization: `token ${token}` } : {};
+  const headers = buildGitHubHeaders(token);
   const base = `https://api.github.com/repos/${owner}/${repo}`;
   const result = { files: [], totalBytes: 0 };
   try {
     // Get default branch
-    const repoRes = await axiosGetWithRetry(base, { headers });
+  const repoRes = await axiosGetWithRetry(base, { headers });
     const defaultBranch = repoRes.data.default_branch || 'main';
     if (logger) try { logger('Determined default branch: ' + defaultBranch) } catch(e){}
     // Get git tree recursively
-    const treeRes = await axiosGetWithRetry(`${base}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`, { headers });
+    let treeRes;
+    try {
+      treeRes = await axiosGetWithRetry(`${base}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`, { headers });
+    } catch (err) {
+      if (err.response && err.response.status === 403) {
+        const rlRemain = err.response.headers?.['x-ratelimit-remaining'];
+        const rlReset = err.response.headers?.['x-ratelimit-reset'];
+        const resetSeconds = rlReset ? Math.max(0, (parseInt(rlReset,10)*1000 - Date.now())/1000).toFixed(0) : null;
+        if (logger) try { logger(`GitHub 403 (tree fetch). Remaining=${rlRemain} reset_in_s=${resetSeconds || 'n/a'} – add or update GITHUB_TOKEN.`); } catch(e){}
+      }
+      throw err;
+    }
     const tree = treeRes.data.tree || [];
     // Filter blobs and keep common source file extensions
     const exts = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.cs', '.rb', '.php', '.json', '.md', '.html', '.css'];
@@ -242,7 +263,27 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
       }
     }
   } catch (err) {
-    if (logger) try { logger('Error while building file list: ' + (err && err.message ? err.message : String(err))); } catch(e){}
+    if (logger) {
+      try {
+        let detail = err && err.message ? err.message : String(err);
+        if (err.response) {
+          detail += ` (status=${err.response.status}`;
+          if (err.response.status === 403) {
+            const rlRemain = err.response.headers?.['x-ratelimit-remaining'];
+            const rlLimit = err.response.headers?.['x-ratelimit-limit'];
+            const rlReset = err.response.headers?.['x-ratelimit-reset'];
+            const resetETA = rlReset ? new Date(parseInt(rlReset,10)*1000).toISOString() : 'unknown';
+            detail += ` rate_limit_remaining=${rlRemain}/${rlLimit} reset_at=${resetETA}`;
+          }
+          if (err.response.data && typeof err.response.data === 'object') {
+            const msg = err.response.data.message || err.response.data.error;
+            if (msg) detail += ` api_message="${msg}"`;
+          }
+          detail += ')';
+        }
+        logger('Error while building file list: ' + detail);
+      } catch(e){}
+    }
     // return partial result
   }
   return result;

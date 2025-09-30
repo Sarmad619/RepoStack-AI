@@ -182,6 +182,22 @@ export default function App(){
             {walkthrough ? (
               <div className="mt-6 p-4 bg-[rgba(255,255,255,0.02)] rounded">
                 <h3 className="text-lg mb-3">Walkthrough</h3>
+                {walkthrough.cannot_answer && (
+                  <div className="mb-4 p-3 border border-red-500/40 bg-red-900/20 rounded">
+                    <div className="text-sm font-semibold text-red-300 mb-1">Cannot answer from repository</div>
+                    <div className="text-xs text-red-200 whitespace-pre-wrap">{walkthrough.reason || 'Requested information not present in repository.'}</div>
+                  </div>
+                )}
+                {!walkthrough.cannot_answer && walkthrough.missing && walkthrough.missing.length>0 && (
+                  <div className="mb-4 p-3 border border-amber-500/40 bg-amber-900/20 rounded">
+                    <div className="text-xs text-amber-200 mb-2">Not found in repo:</div>
+                    <div className="flex flex-wrap gap-2">
+                      {walkthrough.missing.map((m:string,i:number)=>(
+                        <span key={i} className="px-2 py-1 text-[11px] rounded bg-amber-500/20 border border-amber-400/30 text-amber-200">{m}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {/* Answer: render paragraphs for readability */}
                 <div className="text-sm text-gray-100 mb-4">
                   {typeof walkthrough.answer === 'string' ? (
