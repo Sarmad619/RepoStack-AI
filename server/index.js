@@ -63,8 +63,7 @@ if (!process.env.OPENAI_API_KEY) {
   }
 }
 
-// In-memory per-repo rules store: { "owner/repo": { whitelist: [], blacklist: [] } }
-const rulesStore = new Map();
+// (Per-repo rules feature temporarily removed)
 
 
 function sendSSE(res, event, data) {
@@ -151,21 +150,9 @@ async function fetchRepoTreeAndFiles(owner, repo, token, opts = {}, logger = nul
     // Filter blobs and keep common source file extensions
     const exts = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.cs', '.rb', '.php', '.json', '.md', '.html', '.css'];
     const candidates = tree.filter(t => t.type === 'blob' && exts.some(e => t.path.endsWith(e)));
-    // Skip well-known vendor / third-party directories unless overridden by per-repo rules
+  // Skip well-known vendor / third-party directories (per-repo override rules temporarily disabled)
     const skipPatterns = ['node_modules/', 'vendor/', 'third_party/', 'site-packages/', 'dist/', 'build/', 'coverage/', '.pytest_cache/', '.venv/', '__pycache__/', '.git/'];
-    const repoKey = `${owner}/${repo}`;
-    const rules = rulesStore.get(repoKey) || { whitelist: [], blacklist: [] };
-    const filteredCandidates = candidates.filter(t => {
-      // If path matches a whitelist pattern, include it
-      for (const w of rules.whitelist || []) {
-        if (t.path.includes(w)) return true;
-      }
-      // If path matches a blacklist pattern, exclude it
-      for (const b of rules.blacklist || []) {
-        if (t.path.includes(b)) return false;
-      }
-      return !skipPatterns.some(p => t.path.includes(p));
-    });
+    const filteredCandidates = candidates.filter(t => !skipPatterns.some(p => t.path.includes(p)));
     // Sort by path length (prefer top-level) and then by size if available
     filteredCandidates.sort((a, b) => (a.path.split('/').length - b.path.split('/').length) || ((b.size || 0) - (a.size || 0)));
 
@@ -509,27 +496,7 @@ app.get('/api/walkthrough', async (req, res) => {
   }
 });
 
-// Rules management endpoints
-app.get('/api/rules', (req, res) => {
-  const repo = req.query.repo;
-  if (!repo) return res.status(400).json({ error: 'missing repo query parameter' });
-  const m = repo.match(/github.com\/(.+?)\/(.+?)(?:$|\/|\.)/i);
-  if (!m) return res.status(400).json({ error: 'invalid github repo url' });
-  const key = `${m[1]}/${m[2]}`;
-  const rules = rulesStore.get(key) || { whitelist: [], blacklist: [] };
-  res.json({ repo: key, rules });
-});
-
-app.post('/api/rules', (req, res) => {
-  const { repo, rules } = req.body || {};
-  if (!repo || !rules) return res.status(400).json({ error: 'missing repo or rules in body' });
-  const m = repo.match(/(?:github.com\/)?(.+?)\/(.+?)(?:$|\/|\.)/i);
-  if (!m) return res.status(400).json({ error: 'invalid repo format' });
-  const key = `${m[1]}/${m[2]}`;
-  const normalized = { whitelist: Array.isArray(rules.whitelist) ? rules.whitelist : [], blacklist: Array.isArray(rules.blacklist) ? rules.blacklist : [] };
-  rulesStore.set(key, normalized);
-  res.json({ repo: key, rules: normalized });
-});
+// (Per-repo rules endpoints removed temporarily)
 
 // Fetch single file content on-demand (bypasses truncation)
 app.get('/api/file', async (req, res) => {

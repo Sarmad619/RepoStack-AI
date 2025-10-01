@@ -53,47 +53,7 @@ function ReferenceCard({ refData }: any) {
   )
 }
 
-function RuleManager({ repo, onSave }: any) {
-  const [rules, setRules] = useState({ whitelist: [] as string[], blacklist: [] as string[] })
-  const [loading, setLoading] = useState(false)
-
-  useEffect(()=>{
-    if (!repo) return
-    setLoading(true)
-    axios.get(`http://localhost:4000/api/rules?repo=${encodeURIComponent(repo)}`).then(r=>{
-      setRules(r.data.rules || { whitelist: [], blacklist: [] })
-    }).catch(()=>{}).finally(()=>setLoading(false))
-  }, [repo])
-
-  const save = async ()=>{
-    if (!repo) return alert('Set a repo URL first')
-    setLoading(true)
-    try{
-      const r = await axios.post('http://localhost:4000/api/rules', { repo, rules })
-      setRules(r.data.rules)
-      onSave && onSave(r.data.rules)
-    }catch(err){ console.warn(err); alert('Failed to save rules') }
-    setLoading(false)
-  }
-
-  return (
-    <div className="mt-4">
-      <h4 className="text-sm mb-2">Per-repo Rules</h4>
-      <div className="text-xs text-gray-300 mb-2">Whitelist and blacklist are simple substring matches against file paths.</div>
-      <div className="mb-2">
-        <label className="text-xs">Whitelist (include paths)</label>
-        <textarea rows={2} value={rules.whitelist.join('\n')} onChange={e=>setRules(s=>({...s, whitelist: e.target.value.split(/\n/).map(x=>x.trim()).filter(Boolean)}))} className="w-full p-2 bg-transparent border rounded text-sm" />
-      </div>
-      <div className="mb-2">
-        <label className="text-xs">Blacklist (exclude paths)</label>
-        <textarea rows={2} value={rules.blacklist.join('\n')} onChange={e=>setRules(s=>({...s, blacklist: e.target.value.split(/\n/).map(x=>x.trim()).filter(Boolean)}))} className="w-full p-2 bg-transparent border rounded text-sm" />
-      </div>
-      <div className="flex gap-2">
-        <button onClick={save} className="px-3 py-1 bg-[rgba(255,255,255,0.03)] rounded">{loading ? 'Saving...' : 'Save Rules'}</button>
-      </div>
-    </div>
-  )
-}
+// Per-repo RuleManager removed temporarily
 
 export default function App(){
   const [repo, setRepo] = useState('')
@@ -155,7 +115,7 @@ export default function App(){
             <button onClick={analyze} className="px-4 py-2 bg-gradient-to-r from-[#00373a] to-[#00a884] hover:shadow-[0_0_20px_rgba(0,168,132,0.5)] rounded">Analyze</button>
             <button onClick={askWalkthrough} className="px-4 py-2 bg-gradient-to-r from-[#7b6bff] to-[#5a3cff] hover:shadow-[0_0_20px_rgba(123,107,255,0.4)] rounded">Deep Dive</button>
           </div>
-          <RuleManager repo={repo} onSave={(r:any)=>addLog('Updated rules for repo')} />
+          {/* RuleManager removed */}
           <div className="mt-3">
             <input value={question} onChange={e=>setQuestion(e.target.value)} className="w-full p-2 bg-transparent border border-dashed border-gray-600 rounded-md text-sm" />
             <div className="text-xs text-gray-400 mt-1">Ask targeted questions about the codebase (e.g., "Where is auth handled?", "Trace request X").</div>

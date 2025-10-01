@@ -6,3 +6,5 @@ server/node_modules/
 server/.env
 
 Features_add.md
+
+client\dist\
